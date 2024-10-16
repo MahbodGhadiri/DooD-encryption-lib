@@ -9,7 +9,7 @@ use hkdf::Hkdf;
 use rand::thread_rng;
 use serde_json::{self};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{PublicKey, ReusableSecret, SharedSecret};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 /// max number of skipped messages that this implementation of double ratchet tolerates.
 /// exceeding this number cause an error and messages will be considered lost.
@@ -77,25 +77,27 @@ pub struct DHKeyPair {
     pub public_key: PublicKey,
 
     /// reusable private key (each private key is used exactly twice)
-    pub private_key: ReusableSecret,
+    pub private_key: StaticSecret,
 }
 
 /// Current State of Double Ratchet for specific user and session
-pub struct State {
+pub struct DoubleRatchet {
+    is_initial_message: bool,
+
     /// DH Ratchet key pair (the "sending" or "self" ratchet key)
-    pub dh_s: Option<DHKeyPair>,
+    pub dh_s: DHKeyPair,
 
     /// DH Ratchet public key (the "received" or "remote" key)
-    pub dh_public_r: Option<PublicKey>,
+    pub dh_public_r: PublicKey,
 
     /// 32-byte Root Key
-    pub rk: Option<[u8; 32]>,
+    pub rk: [u8; 32],
 
     /// 32-byte Chain Keys for sending
-    pub cks: Vec<[u8; 32]>,
+    pub cks: Option<[u8; 32]>,
 
     /// 32-byte Chain Keys for receiving
-    ckr: Vec<[u8; 32]>,
+    ckr: Option<[u8; 32]>,
 
     ///  Message numbers for sending
     ns: u64,
@@ -111,19 +113,270 @@ pub struct State {
     mk_skipped: Vec<SkippedMessageKey>,
 }
 
-impl State {
-    pub fn new() -> State {
-        State {
-            dh_s: None,
-            dh_public_r: None,
-            rk: None,
-            cks: Vec::new(),
-            ckr: Vec::new(),
+impl DoubleRatchet {
+    pub fn new_sender(sk: [u8; 32], dhs: DHKeyPair, other_public_key: PublicKey) -> Self {
+        let dh_out = dh(&dhs.private_key, &other_public_key).to_bytes();
+
+        let kdf_rk_out = kdf_rk(sk, dh_out);
+
+        Self {
+            dh_s: dhs,
+            dh_public_r: other_public_key,
+            rk: kdf_rk_out.root_key,
+            cks: Some(kdf_rk_out.chain_key),
+            ckr: None,
             ns: 0,
             nr: 0,
             pn: 0,
             mk_skipped: Vec::new(),
+            is_initial_message: true,
         }
+    }
+
+    pub fn new_receiver(
+        sk: [u8; 32],
+        self_dh_key_pair: DHKeyPair,
+        other_public_key: PublicKey,
+    ) -> Self {
+        Self {
+            dh_s: self_dh_key_pair,
+            dh_public_r: other_public_key,
+            rk: sk,
+            cks: None,
+            ckr: None,
+            ns: 0,
+            nr: 0,
+            pn: 0,
+            mk_skipped: Vec::new(),
+            is_initial_message: true,
+        }
+    }
+
+    /// encrypts a byte-array message "plaintext" and returns an EncryptedMessage
+    pub fn ratchet_encrypt(&mut self, plaintext: &[u8]) -> EncryptedMessage {
+        let kdf_out = kdf_ck(&self.cks.unwrap());
+        self.cks = Some(kdf_out.chain_key);
+        let message_key = kdf_out.message_key;
+        let associated_data = kdf_out.aead_nonce;
+
+        let header: String;
+        header = Self::generate_header(&self.dh_s.public_key, self.pn, self.ns);
+
+        self.ns += 1;
+
+        let concat_header = Self::concat(&associated_data, &header);
+
+        let encrypted_data = Self::encrypt(&message_key, plaintext, &concat_header).unwrap();
+        EncryptedMessage::new(concat_header, encrypted_data)
+    }
+
+    /// decrypts an encrypted byte-array message "cipher_text" and returns
+    /// a plain string. requires the corresponding header and associated data.
+    /// note: associated data is prepended to each header before message is sent.
+    pub fn ratchet_decrypt(
+        &mut self,
+        header: &[u8],
+        cipher_text: &[u8],
+        associated_data: &[u8],
+    ) -> String {
+        let parsed_header = Self::read_header(header);
+        let res =
+            Self::try_skipped_message_keys(&self, &parsed_header, cipher_text, associated_data);
+        match res {
+            Some(data) => return Self::decrypted_to_string(data),
+            _ => (),
+        }
+
+        if self.dh_public_r.to_bytes() != parsed_header.public_key {
+            let _ = Self::skip_message_keys(self, parsed_header.pn);
+            self.is_initial_message = false;
+            Self::dhr_ratchet(self, &parsed_header);
+        } else if self.is_initial_message {
+            self.is_initial_message = false;
+            Self::dhr_ratchet(self, &parsed_header);
+        }
+
+        let _ = Self::skip_message_keys(self, parsed_header.n);
+
+        let kdf_ck_out = kdf_ck(&self.ckr.unwrap());
+        self.ckr = Some(kdf_ck_out.chain_key);
+        let key = kdf_ck_out.message_key;
+        self.nr += 1;
+        let decrypted_message = Self::decrypt(&key, cipher_text, associated_data);
+        Self::decrypted_to_string(decrypted_message)
+    }
+
+    // ------------------- encryption --------------------------------------------
+
+    /// Returns an AEAD encryption of plaintext with message key mk.
+    /// The associated_data is authenticated but is not included in the ciphertext.
+    /// Because each message key is only used once, the AEAD nonce may handled in several ways:
+    /// 1. fixed to a constant;
+    /// 2. derived from mk alongside an independent AEAD encryption key;
+    /// 3. derived as an additional output from KDF_CK(); or chosen randomly and transmitted.
+    fn encrypt(
+        key: &[u8],
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, aes_gcm::Error> {
+        let key = Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(key);
+
+        let generic_nonce = Nonce::from_slice(&associated_data[0..12]); // 96-bit nonce
+        cipher.encrypt(generic_nonce, plaintext)
+    }
+
+    /// Creates a new message header containing the DH ratchet public key from the key pair in dh_pair,
+    /// the previous chain length pn, and the message number n.
+    /// The returned header object contains ratchet public key dh and integers pn and n.
+    fn generate_header(dh_public_s: &PublicKey, pn: u64, n: u64) -> String {
+        let str = String::from(format!(
+            "{{\"public_key\": {:?}, \"pn\": {}, \"n\": {}}}",
+            &dh_public_s.to_bytes(),
+            pn,
+            n
+        ));
+        str
+    }
+
+    /// Encodes a message header into a parseable byte sequence,
+    /// prepends the ad byte sequence, and returns the result.
+    /// If ad is not guaranteed to be a parseable byte sequence,
+    /// a length value should be prepended to the output
+    /// to ensure that the output is parseable as a unique pair (ad, header).
+    fn concat(associated_data: &[u8; 32], header: &String) -> Vec<u8> {
+        let mut byte_sequence = Vec::from(associated_data);
+        byte_sequence.extend_from_slice(header.as_bytes());
+
+        byte_sequence
+    }
+
+    // ------------------- decryption --------------------------------------------
+
+    /// Returns the AEAD decryption of ciphertext with message key mk.
+    /// If authentication fails, an exception will be raised that terminates processing.
+    fn decrypt(key: &[u8], cipher_text: &[u8], nonce: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
+        let key = Key::<Aes256Gcm>::from_slice(key);
+        let cipher = Aes256Gcm::new(key);
+
+        let nonce = Nonce::from_slice(&nonce[0..12]); // 96-bit nonce
+        cipher.decrypt(nonce, cipher_text)
+    }
+
+    fn decrypted_to_string(decrypted_message: Result<Vec<u8>, aes_gcm::Error>) -> String {
+        let plain_text: String;
+        match decrypted_message {
+            Ok(data) => {
+                let parse_result = std::str::from_utf8(&data);
+                match parse_result {
+                    Ok(str) => plain_text = str.to_owned(),
+                    _ => panic!("decrypt failed"),
+                }
+            }
+            Err(_) => panic!("decrypt failed"),
+        }
+
+        return plain_text;
+    }
+
+    fn try_skipped_message_keys(
+        &self,
+        header: &ParsedHeader,
+        cipher_text: &[u8],
+        associated_data: &[u8],
+    ) -> Option<Result<Vec<u8>, aes_gcm::Error>> {
+        for skipped_message_key in &self.mk_skipped {
+            if skipped_message_key.public_key == header.public_key
+                && skipped_message_key.n == header.n
+            {
+                return Some(Self::decrypt(
+                    &skipped_message_key.message_key,
+                    cipher_text,
+                    associated_data,
+                ));
+            }
+        }
+
+        return None;
+    }
+
+    fn skip_message_keys(&mut self, until: u64) -> Result<(), &str> {
+        if self.nr + MAX_SKIPPED < until {
+            return Result::Err("Max skip reached");
+        }
+
+        while self.nr < until {
+            let kdf_out = kdf_ck(&self.ckr.unwrap());
+            let chain_key = kdf_out.chain_key;
+            let message_key = kdf_out.message_key;
+
+            self.ckr = Some(chain_key);
+            let skipped_message = SkippedMessageKey {
+                public_key: self.dh_public_r.clone().to_bytes(),
+                message_key,
+                n: self.nr,
+            };
+            self.mk_skipped.push(skipped_message);
+            self.nr += 1;
+        }
+
+        return Ok(());
+    }
+
+    fn read_header(header: &[u8]) -> ParsedHeader {
+        let json_header: serde_json::Value = serde_json::from_slice(header).unwrap();
+        let public_key_vector: &Vec<serde_json::Value> = match &json_header["public_key"] {
+            serde_json::Value::Array(v) => v,
+            _ => panic!("unexpected public key"),
+        };
+        let mut public_key: Vec<u8> = Vec::new();
+        for item in public_key_vector {
+            let x: u8 = match item {
+                serde_json::Value::Number(num) => num.as_u64().unwrap().try_into().unwrap(),
+                _ => panic!("unexpected public key"),
+            };
+            public_key.push(x);
+        }
+        let public_key: [u8; 32] = public_key.try_into().unwrap();
+
+        let n: u64 = match &json_header["n"] {
+            serde_json::Value::Number(num) => num.as_u64().unwrap(),
+            _ => panic!("unexpected n value"),
+        };
+
+        let pn: u64 = match &json_header["pn"] {
+            serde_json::Value::Number(num) => num.as_u64().unwrap(),
+            _ => panic!("unexpected n value"),
+        };
+
+        ParsedHeader { public_key, n, pn }
+    }
+
+    fn dhr_ratchet(&mut self, header: &ParsedHeader) {
+        self.pn = self.ns;
+        self.ns = 0;
+        self.nr = 0;
+        self.dh_public_r = PublicKey::from(header.public_key);
+
+        // new receive key chain
+        let dh_out: SharedSecret;
+
+        dh_out = dh(&self.dh_s.private_key, &self.dh_public_r);
+
+        let kdf_rk_out = kdf_rk(self.rk, dh_out.to_bytes());
+        self.rk = kdf_rk_out.root_key;
+        self.ckr = Some(kdf_rk_out.chain_key);
+
+        //new diffie-hellman key pair
+        let new_key_pair = generate_dh();
+        self.dh_s = new_key_pair;
+
+        // new sending key chain
+        let dh_out = dh(&self.dh_s.private_key, &self.dh_public_r);
+
+        let kdf_rk_out = kdf_rk(self.rk, dh_out.to_bytes());
+        self.rk = kdf_rk_out.root_key;
+        self.cks = Some(kdf_rk_out.chain_key);
     }
 }
 
@@ -136,71 +389,12 @@ impl EncryptedMessage {
     }
 }
 
-/// encrypts a byte-array message "plaintext" and returns an EncryptedMessage
-pub fn ratchet_encrypt(state: &mut State, plaintext: &[u8]) -> EncryptedMessage {
-    let kdf_out = kdf_ck(state.cks.last().unwrap());
-    state.cks.push(kdf_out.chain_key);
-    let message_key = kdf_out.message_key;
-    let associated_data = kdf_out.aead_nonce;
-
-    let header: String;
-    match &state.dh_s {
-        Some(key_pair) => {
-            header = generate_header(&key_pair.public_key, state.pn, state.ns);
-        }
-        _ => panic!("no sending public key exist"),
-    }
-
-    state.ns += 1;
-
-    let concat_header = concat(&associated_data, &header);
-
-    let encrypted_data = encrypt(&message_key, plaintext, &concat_header).unwrap();
-    EncryptedMessage::new(concat_header, encrypted_data)
-}
-
-/// decrypts an encrypted byte-array message "cipher_text" and returns
-/// a plain string. requires the corresponding header and associated data.
-/// note: associated data is prepended to each header before message is sent.
-pub fn ratchet_decrypt(
-    state: &mut State,
-    header: &[u8],
-    cipher_text: &[u8],
-    associated_data: &[u8],
-) -> String {
-    let parsed_header = read_header(header);
-    let res = try_skipped_message_keys(&state, &parsed_header, cipher_text, associated_data);
-    match res {
-        Some(data) => return decrypted_to_string(data),
-        _ => (),
-    }
-
-    match &state.dh_public_r {
-        Some(key) => {
-            if key.to_bytes() != parsed_header.public_key {
-                let _ = skip_message_keys(state, parsed_header.pn);
-                dhr_ratchet(state, &parsed_header);
-            }
-        }
-        _ => {}
-    };
-
-    let _ = skip_message_keys(state, parsed_header.n);
-
-    let kdf_ck_out = kdf_ck(&state.ckr.last().unwrap());
-    state.ckr.push(kdf_ck_out.chain_key);
-    let key = kdf_ck_out.message_key;
-    state.nr += 1;
-    let decrypted_message = decrypt(&key, cipher_text, associated_data);
-    decrypted_to_string(decrypted_message)
-}
-
 // --------- helpers ------------------------------------------------
 
 /// Returns a new Diffie-Hellman key pair.
 pub fn generate_dh() -> DHKeyPair {
     // Generate a random private key.
-    let private_key = ReusableSecret::random_from_rng(thread_rng());
+    let private_key = StaticSecret::random_from_rng(thread_rng());
 
     // Get the corresponding public key.
     let public_key = PublicKey::from(&private_key);
@@ -212,8 +406,8 @@ pub fn generate_dh() -> DHKeyPair {
 
 /// Returns the output from the Diffie-Hellman calculation between the private key from the DH key pair
 /// dh_pair and the DH public key dh_pub.
-pub fn dh(dh_private: &ReusableSecret, dh_pub: &Option<PublicKey>) -> SharedSecret {
-    return dh_private.diffie_hellman(&dh_pub.unwrap());
+pub fn dh(dh_private: &StaticSecret, dh_pub: &PublicKey) -> SharedSecret {
+    return dh_private.diffie_hellman(&dh_pub);
 }
 
 /// Returns a pair (32-byte root key, 32-byte chain key) as the output of applying a KDF keyed
@@ -270,189 +464,4 @@ fn kdf_ck(ck: &[u8; 32]) -> KdfCkOut {
         message_key,
         aead_nonce,
     };
-}
-
-// ------------------- encryption --------------------------------------------
-
-/// Returns an AEAD encryption of plaintext with message key mk.
-/// The associated_data is authenticated but is not included in the ciphertext.
-/// Because each message key is only used once, the AEAD nonce may handled in several ways:
-/// 1. fixed to a constant;
-/// 2. derived from mk alongside an independent AEAD encryption key;
-/// 3. derived as an additional output from KDF_CK(); or chosen randomly and transmitted.
-fn encrypt(
-    key: &[u8],
-    plaintext: &[u8],
-    associated_data: &[u8],
-) -> Result<Vec<u8>, aes_gcm::Error> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-
-    let generic_nonce = Nonce::from_slice(&associated_data[0..12]); // 96-bit nonce
-    cipher.encrypt(generic_nonce, plaintext)
-}
-
-/// Creates a new message header containing the DH ratchet public key from the key pair in dh_pair,
-/// the previous chain length pn, and the message number n.
-/// The returned header object contains ratchet public key dh and integers pn and n.
-fn generate_header(dh_public_s: &PublicKey, pn: u64, n: u64) -> String {
-    let str = String::from(format!(
-        "{{\"public_key\": {:?}, \"pn\": {}, \"n\": {}}}",
-        &dh_public_s.to_bytes(),
-        pn,
-        n
-    ));
-    str
-}
-
-/// Encodes a message header into a parseable byte sequence,
-/// prepends the ad byte sequence, and returns the result.
-/// If ad is not guaranteed to be a parseable byte sequence,
-/// a length value should be prepended to the output
-/// to ensure that the output is parseable as a unique pair (ad, header).
-fn concat(associated_data: &[u8; 32], header: &String) -> Vec<u8> {
-    let mut byte_sequence = Vec::from(associated_data);
-    byte_sequence.extend_from_slice(header.as_bytes());
-
-    byte_sequence
-}
-
-// ------------------- decryption --------------------------------------------
-
-/// Returns the AEAD decryption of ciphertext with message key mk.
-/// If authentication fails, an exception will be raised that terminates processing.
-fn decrypt(key: &[u8], cipher_text: &[u8], nonce: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
-    let key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(key);
-
-    let nonce = Nonce::from_slice(&nonce[0..12]); // 96-bit nonce
-    cipher.decrypt(nonce, cipher_text)
-}
-
-fn decrypted_to_string(decrypted_message: Result<Vec<u8>, aes_gcm::Error>) -> String {
-    let plain_text: String;
-    match decrypted_message {
-        Ok(data) => {
-            let parse_result = std::str::from_utf8(&data);
-            match parse_result {
-                Ok(str) => plain_text = str.to_owned(),
-                _ => panic!("decrypt failed"),
-            }
-        }
-        Err(_) => panic!("decrypt failed"),
-    }
-
-    return plain_text;
-}
-
-fn try_skipped_message_keys(
-    state: &State,
-    header: &ParsedHeader,
-    cipher_text: &[u8],
-    associated_data: &[u8],
-) -> Option<Result<Vec<u8>, aes_gcm::Error>> {
-    for skipped_message_key in &state.mk_skipped {
-        if skipped_message_key.public_key == header.public_key && skipped_message_key.n == header.n
-        {
-            return Some(decrypt(
-                &skipped_message_key.message_key,
-                cipher_text,
-                associated_data,
-            ));
-        }
-    }
-
-    return None;
-}
-
-fn skip_message_keys(state: &mut State, until: u64) -> Result<(), &str> {
-    if state.nr + MAX_SKIPPED < until {
-        return Result::Err("Max skip reached");
-    }
-
-    if state.ckr.len() != 0 {
-        while state.nr < until {
-            let kdf_out = kdf_ck(state.ckr.last().unwrap());
-            let chain_key = kdf_out.chain_key;
-            let message_key = kdf_out.message_key;
-
-            state.ckr.push(chain_key);
-            let skipped_message = SkippedMessageKey {
-                public_key: state.dh_public_r.clone().unwrap().to_bytes(),
-                message_key,
-                n: state.nr,
-            };
-            state.mk_skipped.push(skipped_message);
-            state.nr += 1;
-        }
-    }
-    return Ok(());
-}
-
-fn read_header(header: &[u8]) -> ParsedHeader {
-    let json_header: serde_json::Value = serde_json::from_slice(header).unwrap();
-    let public_key_vector: &Vec<serde_json::Value> = match &json_header["public_key"] {
-        serde_json::Value::Array(v) => v,
-        _ => panic!("unexpected public key"),
-    };
-    let mut public_key: Vec<u8> = Vec::new();
-    for item in public_key_vector {
-        let x: u8 = match item {
-            serde_json::Value::Number(num) => num.as_u64().unwrap().try_into().unwrap(),
-            _ => panic!("unexpected public key"),
-        };
-        public_key.push(x);
-    }
-    let public_key: [u8; 32] = public_key.try_into().unwrap();
-
-    let n: u64 = match &json_header["n"] {
-        serde_json::Value::Number(num) => num.as_u64().unwrap(),
-        _ => panic!("unexpected n value"),
-    };
-
-    let pn: u64 = match &json_header["pn"] {
-        serde_json::Value::Number(num) => num.as_u64().unwrap(),
-        _ => panic!("unexpected n value"),
-    };
-
-    ParsedHeader { public_key, n, pn }
-}
-
-fn dhr_ratchet(state: &mut State, header: &ParsedHeader) {
-    state.pn = state.ns;
-    state.ns = 0;
-    state.nr = 0;
-    state.dh_public_r = Some(PublicKey::from(header.public_key));
-
-    // new receive key chain
-    let dh_out: SharedSecret;
-    match &state.dh_s {
-        Some(key_pair) => {
-            dh_out = dh(&key_pair.private_key, &state.dh_public_r);
-        }
-        _ => {
-            print!("odd case!");
-            let key_pair = generate_dh();
-            dh_out = dh(&key_pair.private_key, &state.dh_public_r);
-            state.dh_s = Some(key_pair);
-        }
-    }
-
-    let kdf_rk_out = kdf_rk(state.rk.unwrap(), dh_out.to_bytes());
-    state.rk = Some(kdf_rk_out.root_key);
-    state.ckr.push(kdf_rk_out.chain_key);
-
-    //new diffie-hellman key pair
-    let new_key_pair = generate_dh();
-    state.dh_s = Some(new_key_pair);
-
-    // new sending key chain
-    let dh_out = match &state.dh_s {
-        Some(key_pair) => dh(&key_pair.private_key, &state.dh_public_r),
-        _ => panic!("expected key pair found None"),
-    };
-
-    let kdf_rk_out = kdf_rk(state.rk.unwrap(), dh_out.to_bytes());
-    state.rk = Some(kdf_rk_out.root_key);
-    state.cks.push(kdf_rk_out.chain_key);
 }
