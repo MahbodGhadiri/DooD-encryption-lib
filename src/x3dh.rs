@@ -3,9 +3,11 @@
 //! using curve X25519
 //! using sha512
 
+use base64::prelude::*;
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::thread_rng;
+use serde_json::{json, Value};
 use sha2::Sha512;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
@@ -67,6 +69,64 @@ impl X3DH {
             mock_server_keys: keys.clone(),
             keys,
         }
+    }
+
+    pub fn from(v: Value) -> X3DH {
+        let identity_key = v.get("identity_key").unwrap().as_str().unwrap();
+        println!("{}", &identity_key);
+        let identity_key: [u8; 32] = BASE64_STANDARD
+            .decode(identity_key)
+            .unwrap()
+            .try_into()
+            .expect("failed");
+        let identity_key = xeddsa::PrivateKey::from(identity_key);
+
+        let signed_pre_key = deserialize_signed_pre_key(
+            v.get("signed_private_pre_key").unwrap().as_str().unwrap(),
+            v.get("signed_signature_pre_key").unwrap().as_str().unwrap(),
+        );
+
+        let one_time_pre_keys =
+            deserialize_one_time_keys(v.get("one_time_keys").unwrap().as_str().unwrap());
+
+        let x3dh_keys = X3DHKeys {
+            identity_key,
+            signed_pre_key,
+            one_time_pre_keys,
+        };
+        X3DH {
+            keys: x3dh_keys.clone(),
+            mock_server_keys: x3dh_keys,
+        }
+    }
+
+    pub fn export(&self) -> Value {
+        let identity_key_bytes = &self.keys.identity_key.private_key_bytes();
+        let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
+
+        let pre_signed_key_bytes = &self.keys.signed_pre_key.0.to_bytes();
+        let pre_signed_key = BASE64_STANDARD.encode(pre_signed_key_bytes);
+
+        let pre_signed_key_signature_bytes = self.keys.signed_pre_key.2.clone();
+        let pre_signed_key_signature = BASE64_STANDARD.encode(pre_signed_key_signature_bytes);
+
+        let mut one_time_private_keys_bytes: Vec<[u8; 32]> = Vec::new();
+        for (private, _) in &self.keys.one_time_pre_keys {
+            one_time_private_keys_bytes.push(private.as_bytes().to_owned());
+        }
+
+        let one_time_private_keys_bytes: Vec<u8> =
+            one_time_private_keys_bytes.into_iter().flatten().collect();
+
+        let one_time_keys = BASE64_STANDARD.encode(one_time_private_keys_bytes);
+        println!("{}", identity_key);
+        let v = json!({
+            "identity_key": identity_key,
+            "signed_private_pre_key": pre_signed_key,
+            "signed_signature_pre_key": pre_signed_key_signature,
+            "one_time_keys": one_time_keys
+        });
+        return v;
     }
 
     //TODO: this should be only used for server, no need on client side
@@ -235,6 +295,46 @@ pub fn generate_signed_pre_key(
         identity_private_key.calculate_signature(&mut csprng, &[&public_key.to_bytes()]);
 
     return (private_key, public_key, signed_pre_key);
+}
+
+pub fn deserialize_signed_pre_key(
+    private_key: &str,
+    signature: &str,
+) -> (StaticSecret, PublicKey, [u8; 64]) {
+    let private_key: [u8; 32] = BASE64_STANDARD
+        .decode(private_key)
+        .unwrap()
+        .try_into()
+        .expect("failed");
+    let private_key = StaticSecret::from(private_key);
+
+    let public_key = x25519_dalek::PublicKey::from(&private_key);
+
+    let signature: [u8; 64] = BASE64_STANDARD
+        .decode(signature)
+        .unwrap()
+        .try_into()
+        .expect("failed");
+
+    return (private_key, public_key, signature);
+}
+
+pub fn deserialize_one_time_keys(one_time_keys: &str) -> Vec<(StaticSecret, PublicKey)> {
+    let one_time_keys: Vec<u8> = BASE64_STANDARD
+        .decode(one_time_keys)
+        .unwrap()
+        .try_into()
+        .expect("failed");
+
+    one_time_keys
+        .chunks(32)
+        .map(|chunk| {
+            let chunk: [u8; 32] = chunk.try_into().expect("failure");
+            let secret_key = StaticSecret::from(chunk);
+            let public_key = x25519_dalek::PublicKey::from(&secret_key);
+            (secret_key, public_key)
+        })
+        .collect()
 }
 
 pub fn generate_one_time_pre_keys() -> Vec<(StaticSecret, PublicKey)> {
