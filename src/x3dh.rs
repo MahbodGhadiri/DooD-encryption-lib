@@ -63,6 +63,7 @@ impl X3DHKeys {
 }
 
 impl X3DH {
+    /// Create a new X3DH instance with random keys.
     pub fn new() -> X3DH {
         let keys = X3DHKeys::new();
         Self {
@@ -71,9 +72,16 @@ impl X3DH {
         }
     }
 
+    /// Create a new X3DH instance from a JSON Value.
+    /// The JSON Value should have the following structure:
+    /// {
+    ///     "identity_key": "base64",
+    ///     "signed_private_pre_key": "base64",
+    ///     "signed_signature_pre_key": "base64",
+    ///     "one_time_keys": "base64"
+    /// }
     pub fn from(v: Value) -> X3DH {
         let identity_key = v.get("identity_key").unwrap().as_str().unwrap();
-        println!("{}", &identity_key);
         let identity_key: [u8; 32] = BASE64_STANDARD
             .decode(identity_key)
             .unwrap()
@@ -100,6 +108,14 @@ impl X3DH {
         }
     }
 
+    /// Export the X3DH instance as a JSON Value.
+    /// The JSON Value will have the following structure:
+    /// {
+    ///     "identity_key": "base64",
+    ///     "signed_private_pre_key": "base64",
+    ///     "signed_signature_pre_key": "base64",
+    ///     "one_time_keys": "base64"
+    /// }
     pub fn export(&self) -> Value {
         let identity_key_bytes = &self.keys.identity_key.private_key_bytes();
         let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
@@ -119,7 +135,6 @@ impl X3DH {
             one_time_private_keys_bytes.into_iter().flatten().collect();
 
         let one_time_keys = BASE64_STANDARD.encode(one_time_private_keys_bytes);
-        println!("{}", identity_key);
         let v = json!({
             "identity_key": identity_key,
             "signed_private_pre_key": pre_signed_key,
@@ -143,6 +158,7 @@ impl X3DH {
         }
     }
 
+    /// Get the signed pre key pair.
     pub fn get_pre_key_pair(&self) -> DHKeyPair {
         let signed_pre_key = &self.keys.signed_pre_key;
         DHKeyPair {
@@ -151,6 +167,9 @@ impl X3DH {
         }
     }
 
+    /// initiate the key agreement.
+    /// used by the client to initiate the key agreement without the need of the other party to be online.
+    /// uses the other party's key bundle, generated beforehand and stored on the server.
     pub fn initiate_key_agreement(
         self: &X3DH,
         key_bundle: X3DHKeyBundle,
@@ -205,6 +224,9 @@ impl X3DH {
         }
     }
 
+    /// Respond to the key agreement.
+    /// Used by one party (bob) to respond to the other party (alice) key agreement initiation.
+    /// Public keys are received from other party in their first message
     pub fn respond_to_key_agreement(
         &mut self,
         alice_public_identity: PublicKey,
@@ -245,6 +267,9 @@ impl X3DH {
         kdf_key
     }
 
+    /// Get a one time private key.
+    /// Used to get a one time private key for the key agreement.
+    /// The private key is removed from the list of one time keys.
     fn get_one_time_private_key(&mut self, public_key: PublicKey) -> StaticSecret {
         let mut index = 0;
         let mut found = false;

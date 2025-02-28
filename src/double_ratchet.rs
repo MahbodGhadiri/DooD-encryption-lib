@@ -5,9 +5,10 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
+use base64::Engine;
 use hkdf::Hkdf;
 use rand::thread_rng;
-use serde_json::{self};
+use serde_json::{self, Value};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
@@ -114,6 +115,187 @@ pub struct DoubleRatchet {
 }
 
 impl DoubleRatchet {
+    /// Returns a JSON representation of the DoubleRatchet object.
+    /// The JSON object contains the following fields:
+    /// - is_initial_message: a boolean value indicating whether the current message is the first message in the session.
+    /// - dh_s: a JSON object containing the public and private keys of the sending DH ratchet key pair.
+    /// - dh_public_r: a JSON object containing the public key of the receiving DH ratchet key pair.
+    /// - rk: a base64-encoded string representation of the 32-byte root key.
+    /// - cks: a base64-encoded string representation of the 32-byte chain key for sending.
+    /// - ckr: a base64-encoded string representation of the 32-byte chain key for receiving.
+    /// - ns: the message number for sending.
+    /// - nr: the message number for receiving.
+    /// - pn: the number of messages in the previous sending chain.
+    /// - mk_skipped: a JSON array containing the skipped-over message keys.
+    pub fn export(&self) -> Value {
+        let mut mk_skipped = Vec::new();
+        for skipped_message_key in &self.mk_skipped {
+            let mut skipped_message_key_json = serde_json::Map::new();
+            skipped_message_key_json.insert(
+                "public_key".to_string(),
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&skipped_message_key.public_key),
+                ),
+            );
+            skipped_message_key_json.insert(
+                "message_key".to_string(),
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(&skipped_message_key.message_key),
+                ),
+            );
+            skipped_message_key_json.insert(
+                "n".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(skipped_message_key.n)),
+            );
+            mk_skipped.push(serde_json::Value::Object(skipped_message_key_json));
+        }
+
+        let mut dh_s = serde_json::Map::new();
+        dh_s.insert(
+            "public_key".to_string(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&self.dh_s.public_key.to_bytes()),
+            ),
+        );
+        dh_s.insert(
+            "private_key".to_string(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&self.dh_s.private_key.to_bytes()),
+            ),
+        );
+
+        let mut dh_public_r = serde_json::Map::new();
+        dh_public_r.insert(
+            "public_key".to_string(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&self.dh_public_r.to_bytes()),
+            ),
+        );
+
+        let mut json = serde_json::Map::new();
+        json.insert(
+            "is_initial_message".to_string(),
+            serde_json::Value::Bool(self.is_initial_message),
+        );
+        json.insert("dh_s".to_string(), serde_json::Value::Object(dh_s));
+        json.insert(
+            "dh_public_r".to_string(),
+            serde_json::Value::Object(dh_public_r),
+        );
+        json.insert(
+            "rk".to_string(),
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&self.rk)),
+        );
+        json.insert(
+            "cks".to_string(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&self.cks.unwrap()),
+            ),
+        );
+        json.insert(
+            "ckr".to_string(),
+            serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&self.ckr.unwrap()),
+            ),
+        );
+        json.insert(
+            "ns".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(self.ns)),
+        );
+        json.insert(
+            "nr".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(self.nr)),
+        );
+        json.insert(
+            "pn".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(self.pn)),
+        );
+        json.insert(
+            "mk_skipped".to_string(),
+            serde_json::Value::Array(mk_skipped),
+        );
+        json.into()
+    }
+
+    /// Returns a DoubleRatchet object from a JSON representation.
+    /// The JSON object should contain the following fields:
+    /// - is_initial_message: a boolean value indicating whether the current message is the first message in the session.
+    /// - dh_s: a JSON object containing the public and private keys of the sending DH ratchet key pair.
+    /// - dh_public_r: a JSON object containing the public key of the receiving DH ratchet key pair.
+    /// - rk: a base64-encoded string representation of the 32-byte root key.
+    /// - cks: a base64-encoded string representation of the 32-byte chain key for sending.
+    /// - ckr: a base64-encoded string representation of the 32-byte chain key for receiving.
+    /// - ns: the message number for sending.
+    /// - nr: the message number for receiving.
+    /// - pn: the number of messages in the previous sending chain.
+    /// - mk_skipped: a JSON array containing the skipped-over message keys.
+    pub fn from(v: Value) -> DoubleRatchet {
+        let is_initial_message = v["is_initial_message"].as_bool().unwrap();
+        let dh_s = v["dh_s"].clone();
+        let dh_s_public_key = base64::engine::general_purpose::STANDARD
+            .decode(dh_s["public_key"].as_str().unwrap())
+            .unwrap();
+        let dh_s_private_key = base64::engine::general_purpose::STANDARD
+            .decode(dh_s["private_key"].as_str().unwrap())
+            .unwrap();
+        let dh_s = DHKeyPair {
+            public_key: PublicKey::from(<[u8; 32]>::try_from(dh_s_public_key).unwrap()),
+            private_key: StaticSecret::from(<[u8; 32]>::try_from(dh_s_private_key).unwrap()),
+        };
+        let dh_public_r = v["dh_public_r"].clone();
+        let dh_public_r = PublicKey::from(
+            <[u8; 32]>::try_from(
+                base64::engine::general_purpose::STANDARD
+                    .decode(dh_public_r["public_key"].as_str().unwrap())
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap(),
+        );
+        let rk = base64::engine::general_purpose::STANDARD
+            .decode(v["rk"].as_str().unwrap())
+            .unwrap();
+        let cks = base64::engine::general_purpose::STANDARD
+            .decode(v["cks"].as_str().unwrap())
+            .unwrap();
+        let ckr = base64::engine::general_purpose::STANDARD
+            .decode(v["ckr"].as_str().unwrap())
+            .unwrap();
+        let ns = v["ns"].as_u64().unwrap();
+        let nr = v["nr"].as_u64().unwrap();
+        let pn = v["pn"].as_u64().unwrap();
+        let mk_skipped = v["mk_skipped"].as_array().unwrap();
+        let mut mk_skipped_vec = Vec::new();
+        for skipped_message_key in mk_skipped {
+            let public_key = base64::engine::general_purpose::STANDARD
+                .decode(skipped_message_key["public_key"].as_str().unwrap())
+                .unwrap();
+            let message_key = base64::engine::general_purpose::STANDARD
+                .decode(skipped_message_key["message_key"].as_str().unwrap())
+                .unwrap();
+            let n = skipped_message_key["n"].as_u64().unwrap();
+            mk_skipped_vec.push(SkippedMessageKey {
+                public_key: public_key.try_into().unwrap(),
+                message_key: message_key.try_into().unwrap(),
+                n,
+            });
+        }
+        DoubleRatchet {
+            is_initial_message,
+            dh_s,
+            dh_public_r,
+            rk: rk.try_into().unwrap(),
+            cks: Some(cks.try_into().unwrap()),
+            ckr: Some(ckr.try_into().unwrap()),
+            ns,
+            nr,
+            pn,
+            mk_skipped: mk_skipped_vec,
+        }
+    }
+
     pub fn new_sender(sk: [u8; 32], dhs: DHKeyPair, other_public_key: PublicKey) -> Self {
         let dh_out = dh(&dhs.private_key, &other_public_key).to_bytes();
 
@@ -239,11 +421,11 @@ impl DoubleRatchet {
         str
     }
 
-    /// Encodes a message header into a parseable byte sequence,
+    /// Encodes a message header into a parsable byte sequence,
     /// prepends the ad byte sequence, and returns the result.
-    /// If ad is not guaranteed to be a parseable byte sequence,
+    /// If ad is not guaranteed to be a parsable byte sequence,
     /// a length value should be prepended to the output
-    /// to ensure that the output is parseable as a unique pair (ad, header).
+    /// to ensure that the output is parsable as a unique pair (ad, header).
     fn concat(associated_data: &[u8; 32], header: &String) -> Vec<u8> {
         let mut byte_sequence = Vec::from(associated_data);
         byte_sequence.extend_from_slice(header.as_bytes());
