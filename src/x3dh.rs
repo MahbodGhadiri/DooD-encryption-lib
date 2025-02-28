@@ -162,9 +162,9 @@ impl X3DH {
         );
 
         if ok {
-            println!("signiture ok");
+            println!("signature ok");
         } else {
-            panic!("signiture not ok");
+            panic!("signature not ok");
         }
 
         let dh_key_pair = generate_dh();
