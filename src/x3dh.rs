@@ -12,13 +12,12 @@ use sha2::Sha512;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
 use crate::double_ratchet::DHKeyPair;
-use crate::xeddsa;
+use crate::xeddsa::{self, PrivateKey};
 
 const INFO: &[u8] = b"DooD-encryption-lib";
 
 pub struct X3DH {
     keys: X3DHKeys,
-    mock_server_keys: X3DHKeys,
 }
 
 pub struct X3DHKeys {
@@ -66,10 +65,7 @@ impl X3DH {
     /// Create a new X3DH instance with random keys.
     pub fn new() -> X3DH {
         let keys = X3DHKeys::new();
-        Self {
-            mock_server_keys: keys.clone(),
-            keys,
-        }
+        Self { keys }
     }
 
     /// Create a new X3DH instance from a JSON Value.
@@ -104,7 +100,6 @@ impl X3DH {
         };
         X3DH {
             keys: x3dh_keys.clone(),
-            mock_server_keys: x3dh_keys,
         }
     }
 
@@ -117,7 +112,7 @@ impl X3DH {
     ///     "one_time_keys": "base64"
     /// }
     pub fn export(&self) -> Value {
-        let identity_key_bytes = &self.keys.identity_key.private_key_bytes();
+        let identity_key_bytes = &self.keys.identity_key.derive_public_key_bytes();
         let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
 
         let pre_signed_key_bytes = &self.keys.signed_pre_key.0.to_bytes();
@@ -142,20 +137,6 @@ impl X3DH {
             "one_time_keys": one_time_keys
         });
         return v;
-    }
-
-    //TODO: this should be only used for server, no need on client side
-    pub fn get_key_bundle(&mut self) -> X3DHKeyBundle {
-        println!("{}", self.mock_server_keys.one_time_pre_keys.len());
-        X3DHKeyBundle {
-            identity_key: self.mock_server_keys.identity_key.derive_public_key_bytes(),
-            signed_pre_key: self.mock_server_keys.signed_pre_key.1.clone(),
-            signed_pre_key_signature: self.mock_server_keys.signed_pre_key.2.clone(),
-            one_time_pre_key: match self.mock_server_keys.one_time_pre_keys.get(7) {
-                Some(key_pair) => Some(key_pair.1),
-                _ => None,
-            },
-        }
     }
 
     /// Get the signed pre key pair.
@@ -286,6 +267,50 @@ impl X3DH {
             return key;
         }
         panic!("invalid key was used!")
+    }
+
+    pub fn generate_challenge(&mut self) -> Vec<u8> {
+        // Generate a random nonce (32 bytes)
+        let nonce: [u8; 32] = rand::random();
+
+        // Get current timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+
+        // Create challenge message: nonce + timestamp
+        let mut message = Vec::with_capacity(40);
+        message.extend_from_slice(&nonce);
+        message.extend_from_slice(&timestamp.to_be_bytes());
+
+        let mut rng = OsRng;
+        // Sign the message with identity key
+        let signature = self
+            .keys
+            .identity_key
+            .calculate_signature(&mut rng, &[&message]);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&timestamp.to_be_bytes());
+        bytes.extend_from_slice(&signature);
+        bytes
+    }
+
+    pub fn verify_challenge(&self, challenge: &[u8], public_key: [u8; 32]) -> bool {
+        // Verify the challenge by checking the signature
+        let (message, signature) = challenge.split_at(40);
+        let (nonce, timestamp) = message.split_at(32);
+        let mut message = Vec::with_capacity(40);
+        message.extend_from_slice(&nonce);
+        message.extend_from_slice(&timestamp);
+        let mut rng = OsRng;
+        // Prepare message as &[&[u8]]
+        let message_refs: [&[u8]; 1] = [&message];
+        // Ensure signature is &[u8; 64]
+        let signature_array: &[u8; 64] = signature.try_into().expect("Signature must be 64 bytes");
+        PrivateKey::verify_signature(&public_key, &message_refs, signature_array)
     }
 }
 

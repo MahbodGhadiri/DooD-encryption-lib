@@ -5,10 +5,10 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use base64::Engine;
+use base64::{prelude::BASE64_STANDARD, Engine};
 use hkdf::Hkdf;
 use rand::thread_rng;
-use serde_json::{self, Value};
+use serde_json::{self, json, Value};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
@@ -53,9 +53,9 @@ struct SkippedMessageKey {
 }
 
 /// parsed message header, containing require info for decryption.
-struct ParsedHeader {
+pub struct ParsedHeader {
     /// sender public key
-    public_key: [u8; 32],
+    pub public_key: [u8; 32],
 
     /// number of message in sending chain
     n: u64,
@@ -341,15 +341,13 @@ impl DoubleRatchet {
         let message_key = kdf_out.message_key;
         let associated_data = kdf_out.aead_nonce;
 
-        let header: String;
-        header = Self::generate_header(&self.dh_s.public_key, self.pn, self.ns);
+        let header =
+            Self::generate_header(&self.dh_s.public_key, self.pn, self.ns, &associated_data);
 
         self.ns += 1;
 
-        let concat_header = Self::concat(&associated_data, &header);
-
-        let encrypted_data = Self::encrypt(&message_key, plaintext, &concat_header).unwrap();
-        EncryptedMessage::new(concat_header, encrypted_data)
+        let encrypted_data = Self::encrypt(&message_key, plaintext, &header).unwrap();
+        EncryptedMessage::new(header, encrypted_data)
     }
 
     /// decrypts an encrypted byte-array message "cipher_text" and returns
@@ -411,14 +409,21 @@ impl DoubleRatchet {
     /// Creates a new message header containing the DH ratchet public key from the key pair in dh_pair,
     /// the previous chain length pn, and the message number n.
     /// The returned header object contains ratchet public key dh and integers pn and n.
-    fn generate_header(dh_public_s: &PublicKey, pn: u64, n: u64) -> String {
-        let str = String::from(format!(
-            "{{\"public_key\": {:?}, \"pn\": {}, \"n\": {}}}",
-            &dh_public_s.to_bytes(),
-            pn,
-            n
-        ));
-        str
+    fn generate_header(
+        dh_public_s: &PublicKey,
+        pn: u64,
+        n: u64,
+        associated_data: &[u8; 32],
+    ) -> Vec<u8> {
+        let header = json!(
+            {
+                "public_key":  BASE64_STANDARD.encode(dh_public_s),
+                "pn": pn,
+                "n": n
+            }
+        )
+        .to_string();
+        Self::concat(&associated_data, &header.into_bytes())
     }
 
     /// Encodes a message header into a parsable byte sequence,
@@ -426,9 +431,9 @@ impl DoubleRatchet {
     /// If ad is not guaranteed to be a parsable byte sequence,
     /// a length value should be prepended to the output
     /// to ensure that the output is parsable as a unique pair (ad, header).
-    fn concat(associated_data: &[u8; 32], header: &String) -> Vec<u8> {
+    fn concat(associated_data: &[u8; 32], header: &Vec<u8>) -> Vec<u8> {
         let mut byte_sequence = Vec::from(associated_data);
-        byte_sequence.extend_from_slice(header.as_bytes());
+        byte_sequence.extend_from_slice(header);
 
         byte_sequence
     }
@@ -505,7 +510,7 @@ impl DoubleRatchet {
         return Ok(());
     }
 
-    fn read_header(header: &[u8]) -> ParsedHeader {
+    pub fn read_header(header: &[u8]) -> ParsedHeader {
         let json_header: serde_json::Value = serde_json::from_slice(header).unwrap();
         let public_key_vector: &Vec<serde_json::Value> = match &json_header["public_key"] {
             serde_json::Value::Array(v) => v,
