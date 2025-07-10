@@ -11,19 +11,16 @@ use serde_json::{json, Value};
 use sha2::Sha512;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 
-use crate::double_ratchet::DHKeyPair;
+use crate::double_ratchet::dh::DHKeyPair;
 use crate::xeddsa::{self, PrivateKey};
+
+pub mod keys;
+use keys::X3DHKeys;
 
 const INFO: &[u8] = b"DooD-encryption-lib";
 
 pub struct X3DH {
     keys: X3DHKeys,
-}
-
-pub struct X3DHKeys {
-    identity_key: xeddsa::PrivateKey,
-    signed_pre_key: (StaticSecret, PublicKey, [u8; 64]),
-    one_time_pre_keys: Vec<(StaticSecret, PublicKey)>,
 }
 
 pub struct X3DHInitializationOutput {
@@ -40,25 +37,6 @@ pub struct X3DHKeyBundle {
     signed_pre_key: PublicKey,
     signed_pre_key_signature: [u8; 64],
     one_time_pre_key: Option<PublicKey>,
-}
-
-impl X3DHKeys {
-    pub fn new() -> X3DHKeys {
-        let identity_key = generate_identity_key();
-        Self {
-            signed_pre_key: generate_signed_pre_key(&identity_key),
-            identity_key,
-            one_time_pre_keys: generate_one_time_pre_keys(),
-        }
-    }
-
-    pub fn clone(&self) -> X3DHKeys {
-        Self {
-            signed_pre_key: self.signed_pre_key.clone(),
-            identity_key: self.identity_key.clone(),
-            one_time_pre_keys: self.one_time_pre_keys.clone(),
-        }
-    }
 }
 
 impl X3DH {
@@ -305,7 +283,6 @@ impl X3DH {
         let mut message = Vec::with_capacity(40);
         message.extend_from_slice(&nonce);
         message.extend_from_slice(&timestamp);
-        let mut rng = OsRng;
         // Prepare message as &[&[u8]]
         let message_refs: [&[u8]; 1] = [&message];
         // Ensure signature is &[u8; 64]
@@ -315,7 +292,7 @@ impl X3DH {
 }
 
 /// Returns a new Diffie-Hellman key pair.
-pub fn generate_dh() -> DHKeyPair {
+fn generate_dh() -> DHKeyPair {
     // Generate a random private key.
     let private_key = StaticSecret::random_from_rng(thread_rng());
 
@@ -329,25 +306,7 @@ pub fn generate_dh() -> DHKeyPair {
 
 // ------ generate keys ----------------------------------------------------------------------
 
-pub fn generate_identity_key() -> xeddsa::PrivateKey {
-    xeddsa::PrivateKey::new(&mut thread_rng())
-}
-
-pub fn generate_signed_pre_key(
-    identity_private_key: &xeddsa::PrivateKey,
-) -> (StaticSecret, PublicKey, [u8; 64]) {
-    let mut csprng = OsRng;
-    let private_key = x25519_dalek::StaticSecret::random_from_rng(csprng);
-
-    let public_key = x25519_dalek::PublicKey::from(&private_key);
-
-    let signed_pre_key =
-        identity_private_key.calculate_signature(&mut csprng, &[&public_key.to_bytes()]);
-
-    return (private_key, public_key, signed_pre_key);
-}
-
-pub fn deserialize_signed_pre_key(
+fn deserialize_signed_pre_key(
     private_key: &str,
     signature: &str,
 ) -> (StaticSecret, PublicKey, [u8; 64]) {
@@ -369,7 +328,7 @@ pub fn deserialize_signed_pre_key(
     return (private_key, public_key, signature);
 }
 
-pub fn deserialize_one_time_keys(one_time_keys: &str) -> Vec<(StaticSecret, PublicKey)> {
+fn deserialize_one_time_keys(one_time_keys: &str) -> Vec<(StaticSecret, PublicKey)> {
     let one_time_keys: Vec<u8> = BASE64_STANDARD
         .decode(one_time_keys)
         .unwrap()
@@ -385,16 +344,6 @@ pub fn deserialize_one_time_keys(one_time_keys: &str) -> Vec<(StaticSecret, Publ
             (secret_key, public_key)
         })
         .collect()
-}
-
-pub fn generate_one_time_pre_keys() -> Vec<(StaticSecret, PublicKey)> {
-    let mut keys: Vec<(StaticSecret, PublicKey)> = Vec::new();
-    for _ in 0..100 {
-        let private_key = x25519_dalek::StaticSecret::random_from_rng(thread_rng());
-        let public_key = x25519_dalek::PublicKey::from(&private_key);
-        keys.push((private_key, public_key));
-    }
-    keys
 }
 
 fn kdf(
