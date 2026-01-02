@@ -33,10 +33,10 @@ pub struct X3DHInitializationOutput {
 }
 
 pub struct X3DHKeyBundle {
-    identity_key: [u8; 32],
-    signed_pre_key: PublicKey,
-    signed_pre_key_signature: [u8; 64],
-    one_time_pre_key: Option<PublicKey>,
+    pub identity_key: [u8; 32],
+    pub signed_pre_key: PublicKey,
+    pub signed_pre_key_signature: [u8; 64],
+    pub one_time_pre_key: Option<PublicKey>,
 }
 
 impl X3DH {
@@ -46,21 +46,75 @@ impl X3DH {
         Self { keys }
     }
 
-    /// Create a new X3DH instance from a JSON Value.
-    /// The JSON Value should have the following structure:
-    /// {
-    ///     "identity_key": "base64",
-    ///     "signed_private_pre_key": "base64",
-    ///     "signed_signature_pre_key": "base64",
-    ///     "one_time_keys": "base64"
-    /// }
-    pub fn from(v: Value) -> X3DH {
+    /// Export only PUBLIC keys for uploading to server
+    pub fn export(&self) -> Value {
+        let identity_key_bytes = &self.keys.identity_key.derive_public_key_bytes();
+        let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
+
+        let pre_signed_key_bytes = &self.keys.signed_pre_key.1.to_bytes();
+        let pre_signed_key = BASE64_STANDARD.encode(pre_signed_key_bytes);
+
+        let pre_signed_key_signature_bytes = self.keys.signed_pre_key.2.clone();
+        let pre_signed_key_signature = BASE64_STANDARD.encode(pre_signed_key_signature_bytes);
+
+        // Export PUBLIC keys only (32 bytes each)
+        let mut one_time_public_keys_bytes: Vec<[u8; 32]> = Vec::new();
+        for (_private, public) in &self.keys.one_time_pre_keys {
+            one_time_public_keys_bytes.push(public.to_bytes());
+        }
+
+        let one_time_public_keys_bytes: Vec<u8> =
+            one_time_public_keys_bytes.into_iter().flatten().collect();
+
+        let one_time_keys = BASE64_STANDARD.encode(one_time_public_keys_bytes);
+
+        // Use field names that match what server expects
+        let v = json!({
+            "identity_key": identity_key,
+            "signed_private_pre_key": pre_signed_key,
+            "signed_signature_pre_key": pre_signed_key_signature,
+            "one_time_keys": one_time_keys
+        });
+        return v;
+    }
+
+    /// Export the complete X3DH state including private keys (for local backup/storage)
+    pub fn export_private(&self) -> Value {
+        let identity_key_bytes = self.keys.identity_key.private_key_bytes();
+        let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
+
+        let pre_signed_key_bytes = &self.keys.signed_pre_key.0.to_bytes();
+        let pre_signed_key = BASE64_STANDARD.encode(pre_signed_key_bytes);
+
+        let pre_signed_key_signature_bytes = self.keys.signed_pre_key.2.clone();
+        let pre_signed_key_signature = BASE64_STANDARD.encode(pre_signed_key_signature_bytes);
+
+        // Export BOTH private and public keys as pairs (64 bytes each: 32 private + 32 public)
+        let mut one_time_keys_bytes: Vec<u8> = Vec::new();
+        for (private, public) in &self.keys.one_time_pre_keys {
+            one_time_keys_bytes.extend_from_slice(private.as_bytes());
+            one_time_keys_bytes.extend_from_slice(public.as_bytes());
+        }
+
+        let one_time_keys = BASE64_STANDARD.encode(one_time_keys_bytes);
+
+        let v = json!({
+            "identity_key": identity_key,
+            "signed_private_pre_key": pre_signed_key,
+            "signed_signature_pre_key": pre_signed_key_signature,
+            "one_time_keys": one_time_keys
+        });
+        return v;
+    }
+
+    /// Create X3DH from private export (for loading from local storage)
+    pub fn from_private(v: Value) -> X3DH {
         let identity_key = v.get("identity_key").unwrap().as_str().unwrap();
         let identity_key: [u8; 32] = BASE64_STANDARD
             .decode(identity_key)
             .unwrap()
             .try_into()
-            .expect("failed");
+            .expect("failed to decode identity key");
         let identity_key = xeddsa::PrivateKey::from(identity_key);
 
         let signed_pre_key = deserialize_signed_pre_key(
@@ -68,8 +122,9 @@ impl X3DH {
             v.get("signed_signature_pre_key").unwrap().as_str().unwrap(),
         );
 
+        // Use private deserialization (64 bytes per key pair)
         let one_time_pre_keys =
-            deserialize_one_time_keys(v.get("one_time_keys").unwrap().as_str().unwrap());
+            deserialize_one_time_keys_private(v.get("one_time_keys").unwrap().as_str().unwrap());
 
         let x3dh_keys = X3DHKeys {
             identity_key,
@@ -79,42 +134,6 @@ impl X3DH {
         X3DH {
             keys: x3dh_keys.clone(),
         }
-    }
-
-    /// Export the X3DH instance as a JSON Value.
-    /// The JSON Value will have the following structure:
-    /// {
-    ///     "identity_key": "base64",
-    ///     "signed_private_pre_key": "base64",
-    ///     "signed_signature_pre_key": "base64",
-    ///     "one_time_keys": "base64"
-    /// }
-    pub fn export(&self) -> Value {
-        let identity_key_bytes = &self.keys.identity_key.derive_public_key_bytes();
-        let identity_key = BASE64_STANDARD.encode(identity_key_bytes);
-
-        let pre_signed_key_bytes = &self.keys.signed_pre_key.0.to_bytes();
-        let pre_signed_key = BASE64_STANDARD.encode(pre_signed_key_bytes);
-
-        let pre_signed_key_signature_bytes = self.keys.signed_pre_key.2.clone();
-        let pre_signed_key_signature = BASE64_STANDARD.encode(pre_signed_key_signature_bytes);
-
-        let mut one_time_private_keys_bytes: Vec<[u8; 32]> = Vec::new();
-        for (private, _) in &self.keys.one_time_pre_keys {
-            one_time_private_keys_bytes.push(private.as_bytes().to_owned());
-        }
-
-        let one_time_private_keys_bytes: Vec<u8> =
-            one_time_private_keys_bytes.into_iter().flatten().collect();
-
-        let one_time_keys = BASE64_STANDARD.encode(one_time_private_keys_bytes);
-        let v = json!({
-            "identity_key": identity_key,
-            "signed_private_pre_key": pre_signed_key,
-            "signed_signature_pre_key": pre_signed_key_signature,
-            "one_time_keys": one_time_keys
-        });
-        return v;
     }
 
     /// Get the signed pre key pair.
@@ -140,7 +159,6 @@ impl X3DH {
         );
 
         if ok {
-            println!("signature ok");
         } else {
             panic!("signature not ok");
         }
@@ -214,14 +232,10 @@ impl X3DH {
 
         let kdf_key = match one_time_private_key {
             Some(one_time_key) => {
-                println!("four way");
                 let dh4 = one_time_key.diffie_hellman(&alice_dh_public_key);
                 kdf(dh1, dh2, dh3, Some(dh4))
             }
-            _ => {
-                println!("three way");
-                kdf(dh1, dh2, dh3, None)
-            }
+            _ => kdf(dh1, dh2, dh3, None),
         };
         kdf_key
     }
@@ -304,7 +318,7 @@ fn generate_dh() -> DHKeyPair {
     }
 }
 
-// ------ generate keys ----------------------------------------------------------------------
+// ------ Deserialization functions ----------------------------------------------------------------------
 
 fn deserialize_signed_pre_key(
     private_key: &str,
@@ -314,7 +328,7 @@ fn deserialize_signed_pre_key(
         .decode(private_key)
         .unwrap()
         .try_into()
-        .expect("failed");
+        .expect("failed to decode signed pre key");
     let private_key = StaticSecret::from(private_key);
 
     let public_key = x25519_dalek::PublicKey::from(&private_key);
@@ -323,23 +337,26 @@ fn deserialize_signed_pre_key(
         .decode(signature)
         .unwrap()
         .try_into()
-        .expect("failed");
+        .expect("failed to decode signature");
 
     return (private_key, public_key, signature);
 }
 
-fn deserialize_one_time_keys(one_time_keys: &str) -> Vec<(StaticSecret, PublicKey)> {
+/// Deserialize one-time keys from PRIVATE export (64 bytes per key pair: 32 private + 32 public)
+/// Used when loading from local storage
+fn deserialize_one_time_keys_private(one_time_keys: &str) -> Vec<(StaticSecret, PublicKey)> {
     let one_time_keys: Vec<u8> = BASE64_STANDARD
         .decode(one_time_keys)
         .unwrap()
         .try_into()
-        .expect("failed");
+        .expect("failed to decode one-time keys");
 
     one_time_keys
-        .chunks(32)
+        .chunks(64) // 64 bytes: 32 private + 32 public
         .map(|chunk| {
-            let chunk: [u8; 32] = chunk.try_into().expect("failure");
-            let secret_key = StaticSecret::from(chunk);
+            let private_bytes: [u8; 32] =
+                chunk[0..32].try_into().expect("invalid private key length");
+            let secret_key = StaticSecret::from(private_bytes);
             let public_key = x25519_dalek::PublicKey::from(&secret_key);
             (secret_key, public_key)
         })

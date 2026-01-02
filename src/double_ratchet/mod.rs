@@ -22,16 +22,16 @@ use kdf::{kdf_ck, kdf_rk};
 const MAX_SKIPPED: u64 = 100;
 
 /// keys and required info related to a skipped message.
-struct SkippedMessageKey {
+pub struct SkippedMessageKey {
     /// expected sender public key for this message
     /// needs to match with the actual key to initialize decryption
-    public_key: [u8; 32],
+    pub public_key: [u8; 32],
 
     /// AEAD key required for decryption of message
     message_key: [u8; 32],
 
     /// message number in chain
-    n: u64,
+    pub n: u64,
 }
 
 /// parsed message header, containing require info for decryption.
@@ -40,10 +40,10 @@ pub struct ParsedHeader {
     pub public_key: [u8; 32],
 
     /// number of message in sending chain
-    n: u64,
+    pub n: u64,
 
     /// number of messages in previous sending chain
-    pn: u64,
+    pub pn: u64,
 }
 
 /// Current State of Double Ratchet for specific user and session
@@ -69,14 +69,14 @@ pub struct DoubleRatchet {
     ns: u64,
 
     ///  Message numbers for receiving
-    nr: u64,
+    pub nr: u64,
 
     ///  Number of messages in previous sending chain
     pn: u64,
 
     /// Dictionary of skipped-over message keys, indexed by ratchet public key and message number.
     ///  Raises an exception if too many elements are stored.
-    mk_skipped: Vec<SkippedMessageKey>,
+    pub mk_skipped: Vec<SkippedMessageKey>,
 }
 
 impl DoubleRatchet {
@@ -153,18 +153,33 @@ impl DoubleRatchet {
             "rk".to_string(),
             serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&self.rk)),
         );
-        json.insert(
-            "cks".to_string(),
-            serde_json::Value::String(
-                base64::engine::general_purpose::STANDARD.encode(&self.cks.unwrap()),
-            ),
-        );
-        json.insert(
-            "ckr".to_string(),
-            serde_json::Value::String(
-                base64::engine::general_purpose::STANDARD.encode(&self.ckr.unwrap()),
-            ),
-        );
+        // json.insert(
+        //     "cks".to_string(),
+        //     serde_json::Value::String(
+        //         base64::engine::general_purpose::STANDARD.encode(&self.cks.unwrap()),
+        //     ),
+        // );
+        // json.insert(
+        //     "ckr".to_string(),
+        //     serde_json::Value::String(
+        //         base64::engine::general_purpose::STANDARD.encode(&self.ckr.unwrap()),
+        //     ),
+        // );
+
+        if let Some(cks) = self.cks {
+            json.insert(
+                "cks".to_string(),
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&cks)),
+            );
+        }
+
+        if let Some(ckr) = self.ckr {
+            json.insert(
+                "ckr".to_string(),
+                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&ckr)),
+            );
+        }
+
         json.insert(
             "ns".to_string(),
             serde_json::Value::Number(serde_json::Number::from(self.ns)),
@@ -198,6 +213,7 @@ impl DoubleRatchet {
     /// - mk_skipped: a JSON array containing the skipped-over message keys.
     pub fn from(v: Value) -> DoubleRatchet {
         let is_initial_message = v["is_initial_message"].as_bool().unwrap();
+
         let dh_s = v["dh_s"].clone();
         let dh_s_public_key = base64::engine::general_purpose::STANDARD
             .decode(dh_s["public_key"].as_str().unwrap())
@@ -209,6 +225,7 @@ impl DoubleRatchet {
             public_key: PublicKey::from(<[u8; 32]>::try_from(dh_s_public_key).unwrap()),
             private_key: StaticSecret::from(<[u8; 32]>::try_from(dh_s_private_key).unwrap()),
         };
+
         let dh_public_r = v["dh_public_r"].clone();
         let dh_public_r = PublicKey::from(
             <[u8; 32]>::try_from(
@@ -219,18 +236,27 @@ impl DoubleRatchet {
             )
             .unwrap(),
         );
+
         let rk = base64::engine::general_purpose::STANDARD
             .decode(v["rk"].as_str().unwrap())
             .unwrap();
-        let cks = base64::engine::general_purpose::STANDARD
-            .decode(v["cks"].as_str().unwrap())
-            .unwrap();
-        let ckr = base64::engine::general_purpose::STANDARD
-            .decode(v["ckr"].as_str().unwrap())
-            .unwrap();
+
+        let cks = v["cks"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+
+        let ckr = v["ckr"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+
         let ns = v["ns"].as_u64().unwrap();
         let nr = v["nr"].as_u64().unwrap();
         let pn = v["pn"].as_u64().unwrap();
+
         let mk_skipped = v["mk_skipped"].as_array().unwrap();
         let mut mk_skipped_vec = Vec::new();
         for skipped_message_key in mk_skipped {
@@ -247,13 +273,14 @@ impl DoubleRatchet {
                 n,
             });
         }
+
         DoubleRatchet {
             is_initial_message,
             dh_s,
             dh_public_r,
             rk: rk.try_into().unwrap(),
-            cks: Some(cks.try_into().unwrap()),
-            ckr: Some(ckr.try_into().unwrap()),
+            cks,
+            ckr,
             ns,
             nr,
             pn,
@@ -328,7 +355,9 @@ impl DoubleRatchet {
         let res =
             Self::try_skipped_message_keys(&self, &parsed_header, cipher_text, associated_data);
         match res {
-            Some(data) => return Self::decrypted_to_string(data),
+            Some(data) => {
+                return Self::decrypted_to_string(data);
+            }
             _ => (),
         }
 
@@ -416,19 +445,13 @@ impl DoubleRatchet {
     }
 
     fn decrypted_to_string(decrypted_message: Result<Vec<u8>, aes_gcm::Error>) -> String {
-        let plain_text: String;
         match decrypted_message {
-            Ok(data) => {
-                let parse_result = std::str::from_utf8(&data);
-                match parse_result {
-                    Ok(str) => plain_text = str.to_owned(),
-                    _ => panic!("decrypt failed"),
-                }
-            }
-            Err(_) => panic!("decrypt failed"),
+            Ok(data) => match std::str::from_utf8(&data) {
+                Ok(str) => str.to_owned(),
+                Err(e) => panic!("Failed to parse decrypted data as UTF-8: {}", e),
+            },
+            Err(e) => panic!("Decryption failed: {:?}", e),
         }
-
-        return plain_text;
     }
 
     fn try_skipped_message_keys(
@@ -477,19 +500,18 @@ impl DoubleRatchet {
 
     pub fn read_header(header: &[u8]) -> ParsedHeader {
         let json_header: serde_json::Value = serde_json::from_slice(header).unwrap();
-        let public_key_vector: &Vec<serde_json::Value> = match &json_header["public_key"] {
-            serde_json::Value::Array(v) => v,
-            _ => panic!("unexpected public key"),
+        let public_key_b64 = match &json_header["public_key"] {
+            serde_json::Value::String(s) => s,
+            _ => panic!("unexpected public key format, expected base64 string"),
         };
-        let mut public_key: Vec<u8> = Vec::new();
-        for item in public_key_vector {
-            let x: u8 = match item {
-                serde_json::Value::Number(num) => num.as_u64().unwrap().try_into().unwrap(),
-                _ => panic!("unexpected public key"),
-            };
-            public_key.push(x);
-        }
-        let public_key: [u8; 32] = public_key.try_into().unwrap();
+
+        let public_key_bytes = BASE64_STANDARD
+            .decode(public_key_b64)
+            .expect("failed to decode public key from base64");
+
+        let public_key: [u8; 32] = public_key_bytes
+            .try_into()
+            .expect("invalid public key length");
 
         let n: u64 = match &json_header["n"] {
             serde_json::Value::Number(num) => num.as_u64().unwrap(),
