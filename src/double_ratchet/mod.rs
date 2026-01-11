@@ -48,8 +48,6 @@ pub struct ParsedHeader {
 
 /// Current State of Double Ratchet for specific user and session
 pub struct DoubleRatchet {
-    is_initial_message: bool,
-
     /// DH Ratchet key pair (the "sending" or "self" ratchet key)
     pub dh_s: DHKeyPair,
 
@@ -63,10 +61,10 @@ pub struct DoubleRatchet {
     pub cks: Option<[u8; 32]>,
 
     /// 32-byte Chain Keys for receiving
-    ckr: Option<[u8; 32]>,
+    pub ckr: Option<[u8; 32]>,
 
     ///  Message numbers for sending
-    ns: u64,
+    pub ns: u64,
 
     ///  Message numbers for receiving
     pub nr: u64,
@@ -77,6 +75,9 @@ pub struct DoubleRatchet {
     /// Dictionary of skipped-over message keys, indexed by ratchet public key and message number.
     ///  Raises an exception if too many elements are stored.
     pub mk_skipped: Vec<SkippedMessageKey>,
+
+    /// If this ratchet has ever sent a meesage
+    pub is_first_message: bool,
 }
 
 impl DoubleRatchet {
@@ -91,6 +92,7 @@ impl DoubleRatchet {
     /// - ns: the message number for sending.
     /// - nr: the message number for receiving.
     /// - pn: the number of messages in the previous sending chain.
+    /// - is_first_messages: if the ratchet has ever sent any message.
     /// - mk_skipped: a JSON array containing the skipped-over message keys.
     pub fn export(&self) -> Value {
         let mut mk_skipped = Vec::new();
@@ -140,10 +142,7 @@ impl DoubleRatchet {
         );
 
         let mut json = serde_json::Map::new();
-        json.insert(
-            "is_initial_message".to_string(),
-            serde_json::Value::Bool(self.is_initial_message),
-        );
+
         json.insert("dh_s".to_string(), serde_json::Value::Object(dh_s));
         json.insert(
             "dh_public_r".to_string(),
@@ -153,18 +152,6 @@ impl DoubleRatchet {
             "rk".to_string(),
             serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&self.rk)),
         );
-        // json.insert(
-        //     "cks".to_string(),
-        //     serde_json::Value::String(
-        //         base64::engine::general_purpose::STANDARD.encode(&self.cks.unwrap()),
-        //     ),
-        // );
-        // json.insert(
-        //     "ckr".to_string(),
-        //     serde_json::Value::String(
-        //         base64::engine::general_purpose::STANDARD.encode(&self.ckr.unwrap()),
-        //     ),
-        // );
 
         if let Some(cks) = self.cks {
             json.insert(
@@ -193,6 +180,10 @@ impl DoubleRatchet {
             serde_json::Value::Number(serde_json::Number::from(self.pn)),
         );
         json.insert(
+            "is_first_message".to_string(),
+            serde_json::Value::Bool(self.is_first_message),
+        );
+        json.insert(
             "mk_skipped".to_string(),
             serde_json::Value::Array(mk_skipped),
         );
@@ -212,8 +203,6 @@ impl DoubleRatchet {
     /// - pn: the number of messages in the previous sending chain.
     /// - mk_skipped: a JSON array containing the skipped-over message keys.
     pub fn from(v: Value) -> DoubleRatchet {
-        let is_initial_message = v["is_initial_message"].as_bool().unwrap();
-
         let dh_s = v["dh_s"].clone();
         let dh_s_public_key = base64::engine::general_purpose::STANDARD
             .decode(dh_s["public_key"].as_str().unwrap())
@@ -256,6 +245,7 @@ impl DoubleRatchet {
         let ns = v["ns"].as_u64().unwrap();
         let nr = v["nr"].as_u64().unwrap();
         let pn = v["pn"].as_u64().unwrap();
+        let is_first_message: bool = v["is_first_message"].as_bool().unwrap();
 
         let mk_skipped = v["mk_skipped"].as_array().unwrap();
         let mut mk_skipped_vec = Vec::new();
@@ -275,7 +265,6 @@ impl DoubleRatchet {
         }
 
         DoubleRatchet {
-            is_initial_message,
             dh_s,
             dh_public_r,
             rk: rk.try_into().unwrap(),
@@ -285,6 +274,7 @@ impl DoubleRatchet {
             nr,
             pn,
             mk_skipped: mk_skipped_vec,
+            is_first_message,
         }
     }
 
@@ -303,7 +293,7 @@ impl DoubleRatchet {
             nr: 0,
             pn: 0,
             mk_skipped: Vec::new(),
-            is_initial_message: true,
+            is_first_message: true,
         }
     }
 
@@ -322,7 +312,7 @@ impl DoubleRatchet {
             nr: 0,
             pn: 0,
             mk_skipped: Vec::new(),
-            is_initial_message: true,
+            is_first_message: true,
         }
     }
 
@@ -337,6 +327,7 @@ impl DoubleRatchet {
             Self::generate_header(&self.dh_s.public_key, self.pn, self.ns, &associated_data);
 
         self.ns += 1;
+        self.is_first_message = false;
 
         let encrypted_data = Self::encrypt(&message_key, plaintext, &header).unwrap();
         EncryptedMessage::new(header, encrypted_data)
@@ -354,19 +345,19 @@ impl DoubleRatchet {
         let parsed_header = Self::read_header(header);
         let res =
             Self::try_skipped_message_keys(&self, &parsed_header, cipher_text, associated_data);
-        match res {
-            Some(data) => {
-                return Self::decrypted_to_string(data);
-            }
-            _ => (),
+        if let Some(data) = res {
+            return Self::decrypted_to_string(data);
         }
 
-        if self.dh_public_r.to_bytes() != parsed_header.public_key {
-            let _ = Self::skip_message_keys(self, parsed_header.pn);
-            self.is_initial_message = false;
-            Self::dhr_ratchet(self, &parsed_header);
-        } else if self.is_initial_message {
-            self.is_initial_message = false;
+        let sender_key_changed = self.dh_public_r.to_bytes() != parsed_header.public_key;
+        let is_first_receive = self.ckr.is_none();
+
+        if sender_key_changed || is_first_receive {
+            // Skip any messages from the previous receiving chain
+            if sender_key_changed {
+                let _ = Self::skip_message_keys(self, parsed_header.pn);
+            }
+
             Self::dhr_ratchet(self, &parsed_header);
         }
 
@@ -376,6 +367,7 @@ impl DoubleRatchet {
         self.ckr = Some(kdf_ck_out.chain_key);
         let key = kdf_ck_out.message_key;
         self.nr += 1;
+
         let decrypted_message = Self::decrypt(&key, cipher_text, associated_data);
         Self::decrypted_to_string(decrypted_message)
     }
@@ -531,8 +523,8 @@ impl DoubleRatchet {
         self.ns = 0;
         self.nr = 0;
         self.dh_public_r = PublicKey::from(header.public_key);
+        self.is_first_message = false;
 
-        // new receive key chain
         let dh_out: SharedSecret;
 
         dh_out = dh(&self.dh_s.private_key, &self.dh_public_r);
@@ -541,15 +533,17 @@ impl DoubleRatchet {
         self.rk = kdf_rk_out.root_key;
         self.ckr = Some(kdf_rk_out.chain_key);
 
-        //new diffie-hellman key pair
         let new_key_pair = generate_dh();
         self.dh_s = new_key_pair;
 
-        // new sending key chain
         let dh_out = dh(&self.dh_s.private_key, &self.dh_public_r);
 
         let kdf_rk_out = kdf_rk(self.rk, dh_out.to_bytes());
         self.rk = kdf_rk_out.root_key;
         self.cks = Some(kdf_rk_out.chain_key);
+    }
+
+    pub fn is_first_message(&self) -> bool {
+        self.is_first_message
     }
 }
